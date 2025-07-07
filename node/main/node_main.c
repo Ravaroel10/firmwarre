@@ -20,20 +20,28 @@ static const char *TAG = "NODE";
 spi_device_handle_t spi;
 
 void send_csi_spi(const uint8_t *data, uint16_t len) {
+    if (len > 256) return; // Hindari overflow
+
     spi_transaction_t t = {
-        .length = len * 8,  // bit
+        .length = len * 8,  // dalam bit
         .tx_buffer = data,
     };
-    esp_err_t ret = spi_device_transmit(spi, &t);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "SPI transmit failed: %s", esp_err_to_name(ret));
+
+    for (int i = 0; i < 3; i++) {
+        esp_err_t ret = spi_device_transmit(spi, &t);
+        if (ret == ESP_OK) return;
+        ESP_LOGW(TAG, "SPI transmit failed (try %d): %s", i + 1, esp_err_to_name(ret));
+        vTaskDelay(pdMS_TO_TICKS(5));
     }
+
+    ESP_LOGE(TAG, "SPI transmit failed permanently");
 }
 
 void csi_callback(void *ctx, wifi_csi_info_t *data) {
     if (data && data->buf) {
         ESP_LOGI(TAG, "CSI len: %d", data->len);
         send_csi_spi(data->buf, data->len);
+        vTaskDelay(pdMS_TO_TICKS(10)); // Throttle biar SPI stabil
     }
 }
 
@@ -47,10 +55,12 @@ void wifi_init_sta() {
 
     wifi_config_t wifi_config = {
         .sta = {
-            .ssid = "WASP_AP",          // GANTI 
-            .password = "wasp1234",     // GANTI 
+            .ssid = "WASP_AP",          // SSID AP
+            .password = "wasp1234",     // Password AP
         },
     };
+
+    ESP_LOGI(TAG, "WiFi connecting to %s", wifi_config.sta.ssid);
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
@@ -92,9 +102,9 @@ void app_main() {
         .shift = false,
     };
 
-    ESP_ERROR_CHECK(esp_wifi_set_csi(true));
     ESP_ERROR_CHECK(esp_wifi_set_csi_config(&csi_config));
     ESP_ERROR_CHECK(esp_wifi_set_csi_rx_cb(&csi_callback, NULL));
+    ESP_ERROR_CHECK(esp_wifi_set_csi(true));
 
     ESP_LOGI(TAG, "Node ready with CSI over SPI");
 }
