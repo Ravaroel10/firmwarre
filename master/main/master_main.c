@@ -5,28 +5,28 @@
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "esp_netif.h"
-#include "driver/spi_slave.h"
+#include "driver/spi_master.h"
 #include "driver/gpio.h"
-#include "driver/uart.h"
+#include "esp_websocket_client.h"
 #include "string.h"
 #include <math.h>
 
-static const char *TAG = "MASTER";
+#define NUM_NODES 8
+#define CSI_BUF_SIZE 256
+#define WEBSOCKET_URI "ws://192.168.4.2:8000/ws" // Ganti alamat backend 
 
-// SPI pin config 
 #define PIN_NUM_MOSI 23
 #define PIN_NUM_MISO 19
 #define PIN_NUM_CLK  18
-#define PIN_NUM_CS   5
+#define CS_PINS { 5, 4, 2, 15, 13, 12, 14, 27 }
 
-#define CSI_BUF_SIZE 256 // 64 subcarrier x 2 (real+imag) x 2 byte = 256
-#define UART_PORT UART_NUM_1
-#define UART_TX_PIN 17
-#define UART_RX_PIN 16
-#define BUF_SIZE 1024
+static const char *TAG = "MASTER";
+
+spi_device_handle_t node_spi[NUM_NODES];
+esp_websocket_client_handle_t ws_client = NULL;
 
 bool calibration_mode = false;
-int16_t phase_offset[64][2] = {0}; // [real, imag] offset per subcarrier
+int16_t phase_offset[64][2] = {0}; // [real, imag]
 
 void wifi_init_ap() {
     ESP_ERROR_CHECK(esp_netif_init());
@@ -40,9 +40,8 @@ void wifi_init_ap() {
         .ap = {
             .ssid = "WASP_AP",
             .password = "wasp1234",
-            .ssid_len = 0,
             .channel = 1,
-            .max_connection = 4,
+            .max_connection = 8,
             .authmode = WIFI_AUTH_WPA_WPA2_PSK,
         },
     };
@@ -50,24 +49,19 @@ void wifi_init_ap() {
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
-
     ESP_LOGI(TAG, "WiFi AP started");
 }
 
-void uart_init() {
-    uart_config_t uart_config = {
-        .baud_rate = 115200,
-        .data_bits = UART_DATA_8_BITS,
-        .parity    = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE
+void websocket_init() {
+    esp_websocket_client_config_t websocket_cfg = {
+        .uri = WEBSOCKET_URI,
     };
-    uart_driver_install(UART_PORT, BUF_SIZE * 2, 0, 0, NULL, 0);
-    uart_param_config(UART_PORT, &uart_config);
-    uart_set_pin(UART_PORT, UART_TX_PIN, UART_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    ws_client = esp_websocket_client_init(&websocket_cfg);
+    esp_websocket_client_start(ws_client);
+    ESP_LOGI(TAG, "WebSocket client started");
 }
 
-void send_csi_over_uart(int16_t *csi, int num_subcarriers) {
+void send_csi_over_ws(int esp_id, int16_t *csi, int num_subcarriers) {
     char json[1024] = {0};
     for (int i = 0; i < num_subcarriers; i++) {
         int amp = csi[i * 2];
@@ -79,26 +73,28 @@ void send_csi_over_uart(int16_t *csi, int num_subcarriers) {
     if (len > 0) json[len - 1] = 0;
 
     char output[1100];
-    sprintf(output, "{\"esp_id\":0,\"amplitudes\":[%s]}\n", json);
-    uart_write_bytes(UART_PORT, output, strlen(output));
+    sprintf(output, "{\"esp_id\":%d,\"amplitudes\":[%s]}", esp_id, json);
+    if (esp_websocket_client_is_connected(ws_client)) {
+        esp_websocket_client_send_text(ws_client, output, strlen(output), portMAX_DELAY);
+    }
 }
 
 void apply_phase_correction(int16_t *data, int num_subcarriers) {
     for (int i = 0; i < num_subcarriers; i++) {
-        data[i * 2] -= phase_offset[i][0];     // real
-        data[i * 2 + 1] -= phase_offset[i][1]; // imag
+        data[i * 2] -= phase_offset[i][0];
+        data[i * 2 + 1] -= phase_offset[i][1];
     }
 }
 
 void calibrate_phase_reference(const int16_t *data, int num_subcarriers) {
     for (int i = 0; i < num_subcarriers; i++) {
-        phase_offset[i][0] = data[i * 2];     // real
-        phase_offset[i][1] = data[i * 2 + 1]; // imag
+        phase_offset[i][0] = data[i * 2];
+        phase_offset[i][1] = data[i * 2 + 1];
     }
     ESP_LOGI(TAG, "Phase offset calibrated.");
 }
 
-void process_csi_data(const uint8_t *data, size_t length_bytes) {
+void process_csi_data(int node_id, const uint8_t *data, size_t length_bytes) {
     int num_subcarriers = length_bytes / 4;
     int16_t *csi = (int16_t *)data;
 
@@ -106,33 +102,31 @@ void process_csi_data(const uint8_t *data, size_t length_bytes) {
         calibrate_phase_reference(csi, num_subcarriers);
     } else {
         apply_phase_correction(csi, num_subcarriers);
-        for (int i = 0; i < num_subcarriers; i++) {
-            ESP_LOGI(TAG, "CSI[%d] = %d + j%d", i, csi[i * 2], csi[i * 2 + 1]);
-        }
-        send_csi_over_uart(csi, num_subcarriers);
+        send_csi_over_ws(node_id, csi, num_subcarriers);
     }
 }
 
-void spi_slave_task(void *arg) {
-    uint8_t recvbuf[CSI_BUF_SIZE];
-    spi_slave_transaction_t t;
-    memset(&t, 0, sizeof(t));
-    t.length = CSI_BUF_SIZE * 8; // in bits
-    t.rx_buffer = recvbuf;
+void send_command_to_node(int node_id, const uint8_t *cmd, size_t len) {
+    if (node_id < 0 || node_id >= NUM_NODES) {
+        ESP_LOGW(TAG, "Invalid node ID: %d", node_id);
+        return;
+    }
 
-    while (1) {
-        esp_err_t ret = spi_slave_transmit(HSPI_HOST, &t, portMAX_DELAY);
-        if (ret == ESP_OK) {
-            ESP_LOGI(TAG, "Received CSI over SPI: %d bytes", t.trans_len / 8);
-            process_csi_data(recvbuf, t.trans_len / 8);
-        }
+    spi_transaction_t t = {
+        .length = len * 8,
+        .tx_buffer = cmd,
+    };
+
+    esp_err_t ret = spi_device_transmit(node_spi[node_id], &t);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "Sent command to node %d: %.*s", node_id, len, cmd);
+    } else {
+        ESP_LOGW(TAG, "Failed to send command to node %d: %s", node_id, esp_err_to_name(ret));
     }
 }
 
-void app_main() {
-    ESP_ERROR_CHECK(nvs_flash_init());
-    wifi_init_ap();
-    uart_init();
+void init_all_nodes() {
+    int cs_pins[NUM_NODES] = CS_PINS;
 
     spi_bus_config_t buscfg = {
         .mosi_io_num = PIN_NUM_MOSI,
@@ -141,17 +135,53 @@ void app_main() {
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
     };
+    ESP_ERROR_CHECK(spi_bus_initialize(HSPI_HOST, &buscfg, SPI_DMA_CH_AUTO));
 
-    spi_slave_interface_config_t slvcfg = {
-        .spics_io_num = PIN_NUM_CS,
-        .mode = 0,
-        .queue_size = 3,
+    for (int i = 0; i < NUM_NODES; i++) {
+        spi_device_interface_config_t devcfg = {
+            .clock_speed_hz = 1 * 1000 * 1000,
+            .mode = 0,
+            .spics_io_num = cs_pins[i],
+            .queue_size = 1,
+        };
+        ESP_ERROR_CHECK(spi_bus_add_device(HSPI_HOST, &devcfg, &node_spi[i]));
+    }
+
+    ESP_LOGI(TAG, "All %d SPI nodes initialized", NUM_NODES);
+}
+
+void csi_poll_task(void *arg) {
+    uint8_t recvbuf[CSI_BUF_SIZE];
+    spi_transaction_t t = {
+        .length = CSI_BUF_SIZE * 8,
+        .rx_buffer = recvbuf,
     };
 
-    ESP_ERROR_CHECK(spi_slave_initialize(HSPI_HOST, &buscfg, &slvcfg, SPI_DMA_CH_AUTO));
-    ESP_LOGI(TAG, "SPI slave initialized");
+    while (1) {
+        for (int i = 0; i < NUM_NODES; i++) {
+            memset(recvbuf, 0, CSI_BUF_SIZE);
+            esp_err_t ret = spi_device_transmit(node_spi[i], &t);
+            if (ret == ESP_OK) {
+                process_csi_data(i, recvbuf, CSI_BUF_SIZE);
+            }
+            vTaskDelay(pdMS_TO_TICKS(5));
+        }
+    }
+}
+
+void app_main() {
+    ESP_ERROR_CHECK(nvs_flash_init());
+    wifi_init_ap();
+    websocket_init();
+    init_all_nodes();
 
     calibration_mode = true;
 
-    xTaskCreate(spi_slave_task, "spi_slave_task", 4096, NULL, 5, NULL);
+    // Contoh kirim perintah ke semua node (opsional)
+    const char *start_cmd = "START_CSI";
+    for (int i = 0; i < NUM_NODES; i++) {
+        send_command_to_node(i, (const uint8_t *)start_cmd, strlen(start_cmd));
+    }
+
+    xTaskCreate(csi_poll_task, "csi_poll_task", 4096, NULL, 5, NULL);
 }
